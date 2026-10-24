@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +17,23 @@ def squash(x, dim=-1):
     squared_norm = (x ** 2).sum(dim=dim, keepdim=True)
     scale = squared_norm / (1 + squared_norm)
     return scale * x / torch.sqrt(squared_norm + 1e-8)
+
+# ==========================================
+# 1.5 损失函数：Margin Loss
+# ==========================================
+def margin_loss(probs, target, num_classes=10, m_plus=0.9, m_minus=0.1, lam=0.5):
+    """
+    胶囊网络的标准损失：直接把向量模长当作"存在概率"来约束，
+    正确类别的模长拉向 m_plus，错误类别的模长压向 m_minus。
+    probs: [batch, num_classes] 每个类别的胶囊模长
+    target: [batch] 类别标签
+    """
+    one_hot = F.one_hot(target, num_classes).float()
+    # 正确类别: max(0, m+ - ||v||)^2
+    left = (torch.clamp(m_plus - probs, min=0) ** 2) * one_hot
+    # 错误类别: max(0, ||v|| - m-)^2
+    right = (torch.clamp(probs - m_minus, min=0) ** 2) * (1 - one_hot)
+    return (left + lam * right).sum(dim=1).mean()
 
 # ==========================================
 # 2. 核心层：PrimaryCapsule (初级胶囊层)
@@ -53,7 +72,9 @@ class DigitCapsule(nn.Module):
         self.num_routing = num_routing
         
         # 权重矩阵 W: [1, 输入胶囊数, 输出胶囊数, 输出维度, 输入维度]
-        self.W = nn.Parameter(torch.randn(1, in_capsules, out_capsules, out_dim, in_dim))
+        # 乘 0.1 是为了让初始预测向量保持小量级：squash 对模长的压缩是平方级的，
+        # 若 W 用 randn(std=1)，初始 s_j 的模长就会接近 1，squash 直接饱和、梯度归零。
+        self.W = nn.Parameter(torch.randn(1, in_capsules, out_capsules, out_dim, in_dim) * 0.1)
 
     def forward(self, x):
         batch_size = x.size(0)
@@ -116,9 +137,9 @@ class CapsNet(nn.Module):
 # ==========================================
 # 5. 训练与测试流程
 # ==========================================
-def train_and_test():
+def train_and_test(loss_type='margin'):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device}, loss: {loss_type}")
 
     # 数据加载
     transform = transforms.Compose([transforms.ToTensor()])
@@ -131,11 +152,11 @@ def train_and_test():
     # 初始化模型、优化器和损失函数
     model = CapsNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    # Margin Loss 是胶囊网络常用的损失函数，这里为了简化 Demo 直接用交叉熵
-    criterion = nn.CrossEntropyLoss() 
+    # 胶囊网络的输出是"模长"，不能用交叉熵（它期望无界 logits），要用 Margin Loss
+    # margin: 胶囊网络标准损失；ce: 交叉熵，仅用于 A/B 对照
+    criterion = nn.CrossEntropyLoss() if loss_type == 'ce' else None
 
-    # 训练一个 Epoch（演示用，实际需要更多 epoch）
-    epochs = 2
+    epochs = 5
     for epoch in range(epochs):
         model.train()
         total_loss = 0
@@ -144,7 +165,7 @@ def train_and_test():
             
             optimizer.zero_grad()
             probs = model(data) # 输出是每个类别的概率（模长）
-            loss = criterion(probs, target)
+            loss = criterion(probs, target) if criterion is not None else margin_loss(probs, target)
             loss.backward()
             optimizer.step()
             
@@ -152,6 +173,8 @@ def train_and_test():
             
             if batch_idx % 100 == 0:
                 print(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+        
+        avg_loss = total_loss / len(train_loader)
         
         # 测试
         model.eval()
@@ -166,7 +189,11 @@ def train_and_test():
                 total += target.size(0)
         
         acc = 100. * correct / total
-        print(f"====> Epoch {epoch+1} Test Accuracy: {acc:.2f}%")
+        print(f"====> Epoch {epoch+1} Avg Loss: {avg_loss:.4f}, Test Accuracy: {acc:.2f}%")
 
 if __name__ == '__main__':
-    train_and_test()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--loss', choices=['margin', 'ce'], default='margin',
+                        help='margin=胶囊标准损失（默认）, ce=交叉熵（A/B 对照用）')
+    args = parser.parse_args()
+    train_and_test(args.loss)
