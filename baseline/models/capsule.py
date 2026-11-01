@@ -1,12 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import einsum  # 强烈推荐用 einsum，语义极其清晰
 
-# 如果没有 einops，请 pip install einops
-try:
-    from einops import rearrange
-except ImportError:
-    print("请安装 einops 库: pip install einops")
 
 class PrimaryCaps(nn.Module):
     """初级胶囊层"""
@@ -14,19 +10,23 @@ class PrimaryCaps(nn.Module):
         super(PrimaryCaps, self).__init__()
         self.capsule_dim = capsule_dim
         self.out_capsules = out_capsules
+        
         # 用卷积生成胶囊特征
+        # 输出通道数为 out_capsules * capsule_dim
         self.conv = nn.Conv2d(in_channels, out_capsules * capsule_dim, 
                               kernel_size=kernel_size, stride=stride, bias=False)
 
     def forward(self, x):
-        # x: (B, C, H, W)
-        out = self.conv(x) # (B, out_capsules * capsule_dim, H', W')
-        B, _, H, W = out.size()
-        # 重塑为胶囊结构: (B, out_capsules, capsule_dim, H', W')
-        out = out.view(B, self.out_capsules, self.capsule_dim, H, W)
-        # 将空间维度展平，变成 (B, N, capsule_dim)，其中 N = out_capsules * H' * W'
-        out = out.permute(0, 1, 3, 4, 2).contiguous()
-        out = out.view(B, -1, self.capsule_dim)
+        # x: (B, in_channels, H, W)
+        out = self.conv(x) 
+        # 此时 out 形状: (B, out_capsules * capsule_dim, H', W')
+        
+        # 【核心修改】使用 einops 一行完成拆分与重排
+        # 逻辑：把通道维 (n d) 拆开，把空间维 (h w) 合并，最后把胶囊维度 d 放到最后
+        out = rearrange(out, 'b (n d) h w -> b (n h w) d', 
+                        n=self.out_capsules, d=self.capsule_dim)
+        
+        # 此时 out 形状: (B, N, capsule_dim)，其中 N = out_capsules * H' * W'
         
         # Squash 非线性
         return self.squash(out)
@@ -36,6 +36,8 @@ class PrimaryCaps(nn.Module):
         norm = torch.norm(s, dim=dim, keepdim=True)
         norm_squared = norm ** 2
         return (norm_squared / (1 + norm_squared)) * (s / (norm + 1e-8))
+
+
 
 
 class DigitCaps(nn.Module):
@@ -49,6 +51,7 @@ class DigitCaps(nn.Module):
         self.num_routing = num_routing
         
         # 变换矩阵 W: (1, in_caps, num_caps, out_dim, in_dim)
+        # 使用标准正态分布初始化，并乘以一个缩小系数（这也是原版的做法）
         self.W = nn.Parameter(torch.randn(1, in_caps, num_caps, out_dim, in_dim) * 0.01)
 
     def forward(self, x):
@@ -56,27 +59,28 @@ class DigitCaps(nn.Module):
         B = x.size(0)
         
         # 1. 计算预测向量 u_hat: (B, in_caps, num_caps, out_dim)
-        # 对应论文公式 2.19
-        x_expanded = x.unsqueeze(2).unsqueeze(4) # (B, in_caps, 1, in_dim, 1)
-        W_expanded = self.W.expand(B, -1, -1, -1, -1) # (B, in_caps, num_caps, out_dim, in_dim)
-        u_hat = torch.matmul(W_expanded, x_expanded).squeeze(4) # (B, in_caps, num_caps, out_dim)
+        # 【修正】：使用 einsum 替代 unsqueeze+matmul+squeeze，代码更优雅、无歧义
+        # 解释：对每个 batch(b)，输入胶囊(i)的向量(d)，乘上变换矩阵(i, j, o, d)，输出 (b, i, j, o)
+        # 注意：这里 einops 的 einsum 自动处理了 W 的 batch 广播
+        u_hat = einsum(self.W, x, 'b i j o d, b i d -> b i j o')
         
         # 2. 动态路由
         b_ij = torch.zeros(B, self.in_caps, self.num_caps, 1).to(x.device)
-        u_hat_detached = u_hat.detach()
         
         for i in range(self.num_routing):
-            c_ij = F.softmax(b_ij, dim=2) # 耦合系数
+            c_ij = F.softmax(b_ij, dim=2) # 耦合系数 (B, in_caps, num_caps, 1)
             
             # 计算高层胶囊输入 s_j
-            s_j = (c_ij * u_hat_detached).sum(dim=1, keepdim=True) # (B, 1, num_caps, out_dim)
+            # 利用广播机制：(B, in_caps, num_caps, 1) * (B, in_caps, num_caps, out_dim)
+            s_j = (c_ij * u_hat).sum(dim=1, keepdim=True) # (B, 1, num_caps, out_dim)
             
             # Squash 得到 v_j
             v_j = self.squash(s_j) # (B, 1, num_caps, out_dim)
             
             if i < self.num_routing - 1:
                 # 更新 b_ij (点积一致性)
-                b_ij = b_ij + (u_hat_detached * v_j).sum(dim=-1, keepdim=True)
+                # 【修正】：去掉了 detach，让梯度流动更自然
+                b_ij = b_ij + (u_hat * v_j).sum(dim=-1, keepdim=True)
                 
         return v_j.squeeze(1) # (B, num_caps, out_dim)
 
