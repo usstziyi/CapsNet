@@ -6,6 +6,7 @@ class ChannelAttention(nn.Module):
     """通道注意力 (2.4.3节)"""
     def __init__(self, channels, reduction=16):
         super(ChannelAttention, self).__init__()
+        # (B, C, H, W) -> (B, C, 1, 1)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         

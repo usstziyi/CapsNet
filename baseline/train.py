@@ -18,7 +18,7 @@ def train():
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     # 3. 模拟数据加载 (B, C, H, W) -> (8, 1, 11, 4500)
-    # 假设 H=11 (通道数), W=4500 (时间点)
+    # C是特征通道维
     x_alpha = torch.randn(batch_size, 1, 11, 4500)
     x_beta = torch.randn(batch_size, 1, 11, 4500)
     labels = torch.randint(0, 2, (batch_size,)).float() # 标签 0 或 1
